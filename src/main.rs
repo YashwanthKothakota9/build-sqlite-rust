@@ -35,6 +35,30 @@ fn main() -> anyhow::Result<()> {
 
             println!("{}", table_names);
         }
+        command if command.starts_with("select count(*) from") => {
+            let parts: Vec<&str> = command.split_whitespace().collect();
+            let table_name = parts.last().unwrap();
+
+            let table_record = db
+                .root_page
+                .records()
+                .find(|record| match &record.values[1] {
+                    RecordValue::Text(name) => name == table_name,
+                    _ => false,
+                });
+            let table_record = match table_record {
+                Some(record) => record,
+                None => bail!("Table not found: {}", table_name),
+            };
+            let root_page = match &table_record.values[3] {
+                RecordValue::Int(page_num) => *page_num as usize,
+                _ => bail!("Invalid root page value for table: {}", table_name),
+            };
+            let table_page = db.load_page(db_path, root_page)?;
+
+            let count = table_page.records().count();
+            println!("{}", count);
+        }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
 

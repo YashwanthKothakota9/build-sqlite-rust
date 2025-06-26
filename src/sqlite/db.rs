@@ -1,4 +1,7 @@
-use std::{fs::File, io::Read};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+};
 
 const DB_HEADER_SIZE: usize = 100;
 
@@ -151,5 +154,24 @@ impl Database {
             page_size,
             root_page,
         })
+    }
+
+    pub fn load_page(&self, path: &str, page_number: usize) -> anyhow::Result<Page> {
+        let mut file = File::open(path)?;
+        let page_offset = if page_number == 1 {
+            DB_HEADER_SIZE
+        } else {
+            (page_number - 1) * (self.page_size as usize)
+        };
+        file.seek(SeekFrom::Start(page_offset as u64))?;
+        let page_data_size = if page_number == 1 {
+            self.page_size as usize - DB_HEADER_SIZE
+        } else {
+            self.page_size as usize
+        };
+        let mut page_data = vec![0; page_data_size];
+        file.read_exact(&mut page_data)?;
+
+        Ok(Page::from_data(self.page_size, page_data))
     }
 }
