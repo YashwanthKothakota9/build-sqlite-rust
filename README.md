@@ -25,3 +25,5 @@ and more.
 3. Print table names
 4. Count rows in a table
 5. Read data from a single column in a table
+6. Read data from multiple columns in a table
+7. Filter data with a `where` clause
