@@ -11,22 +11,25 @@ pub enum RecordValue {
     Int(i64),
     Real(f64),
     Text(String),
+    #[allow(dead_code)]
     Blob(Vec<u8>),
 }
 
 #[derive(Debug)]
 pub struct Record {
+    #[allow(dead_code)]
     pub id: u64,
     pub values: Vec<RecordValue>,
 }
 
 #[derive(Debug)]
-enum PageType {
+pub enum PageType {
     TableLeaf,
 }
 
 #[derive(Debug)]
 pub struct Page {
+    #[allow(dead_code)]
     pub typ: PageType,
     pub cell_pointers: Vec<usize>,
     data: Vec<u8>,
