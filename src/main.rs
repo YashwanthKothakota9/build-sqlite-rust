@@ -6,6 +6,17 @@ use anyhow::bail;
 
 use sqlite::{Database, RecordValue};
 
+// Add this function before your main() function
+fn format_record_value(value: &RecordValue) -> String {
+    match value {
+        RecordValue::Text(text) => text.clone(),
+        RecordValue::Int(number) => number.to_string(),
+        RecordValue::Real(float) => float.to_string(),
+        RecordValue::Null => "NULL".to_string(),
+        RecordValue::Blob(_) => "[BLOB]".to_string(),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args = env::args().collect::<Vec<_>>();
     match args.len() {
@@ -74,7 +85,15 @@ fn main() -> anyhow::Result<()> {
                 .position(|&word| word.to_lowercase() == "from")
                 .unwrap();
 
-            let column_name = parts[select_pos + 1];
+            // let column_name = parts[select_pos + 1];
+
+            let columns_slice = &parts[select_pos + 1..from_pos];
+            let columns_string = columns_slice.join(" ");
+            let requested_column_names: Vec<&str> =
+                columns_string.split(",").map(|s| s.trim()).collect();
+
+            // eprintln!("requested_column_names: {:?}", requested_column_names);
+
             let table_name = parts[from_pos + 1];
 
             // eprintln!("column_name: {}", column_name);
@@ -116,42 +135,58 @@ fn main() -> anyhow::Result<()> {
 
             // eprintln!("column_definitions: {:?}", column_definitions);
 
-            let column_names: Vec<&str> = column_definitions
+            let schema_column_names: Vec<&str> = column_definitions
                 .iter()
                 .map(|def| def.trim().split_whitespace().next().unwrap())
                 .collect();
 
             // eprintln!("column_names: {:?}", column_names);
 
-            let column_position = column_names.iter().position(|&name| name == column_name);
+            let mut column_positions: Vec<usize> = Vec::new();
 
-            let column_position = match column_position {
-                Some(pos) => pos,
-                None => bail!(
-                    "Column '{}' not found in table '{}'",
-                    column_name,
-                    table_name
-                ),
-            };
+            for &requested_column in &requested_column_names {
+                let position = schema_column_names
+                    .iter()
+                    .position(|&schema_col| schema_col == requested_column);
 
+                let position = match position {
+                    Some(pos) => pos,
+                    None => bail!(
+                        "Column '{}' not found in table '{}'",
+                        requested_column,
+                        table_name
+                    ),
+                };
+
+                column_positions.push(position);
+            }
+
+            // Debug output to verify it works:
+            // println!("Column positions: {:?}", column_positions);
             let table_page = db.load_page(db_path, rootpage)?;
 
             for record in table_page.records() {
-                if record.values.len() <= column_position {
+                // Bounds checking: ensure record has enough columns
+                let max_position = column_positions.iter().max().unwrap_or(&0);
+                if record.values.len() <= *max_position {
                     bail!(
                         "Record doesn't have enough columns for position {}",
-                        column_position
+                        max_position
                     );
                 }
-                let column_value = &record.values[column_position];
 
-                match column_value {
-                    RecordValue::Text(text) => println!("{}", text),
-                    RecordValue::Int(number) => println!("{}", number),
-                    RecordValue::Real(float) => println!("{}", float),
-                    RecordValue::Null => println!("NULL"),
-                    RecordValue::Blob(_) => println!("[BLOB]"),
+                // Extract and format values for all requested columns
+                let mut row_values: Vec<String> = Vec::new();
+
+                for &position in &column_positions {
+                    let column_value = &record.values[position];
+                    let formatted_value = format_record_value(column_value);
+                    row_values.push(formatted_value);
                 }
+
+                // Join values with "|" and output
+                let row_output = row_values.join("|");
+                println!("{}", row_output);
             }
         }
         _ => bail!("Missing or invalid command passed: {}", command),
