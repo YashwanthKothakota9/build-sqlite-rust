@@ -25,6 +25,7 @@ pub struct Record {
 #[derive(Debug)]
 pub enum PageType {
     TableLeaf,
+    TableInterior,
 }
 
 #[derive(Debug)]
@@ -32,6 +33,7 @@ pub struct Page {
     #[allow(dead_code)]
     pub typ: PageType,
     pub cell_pointers: Vec<usize>,
+    pub right_most_child: Option<u32>,
     data: Vec<u8>,
 }
 
@@ -39,20 +41,41 @@ impl Page {
     fn from_data(page_size: u16, data: Vec<u8>) -> Self {
         let typ = match data[0] {
             13 => PageType::TableLeaf,
+            5 => PageType::TableInterior,
             _ => panic!("Invalid page type: {}", data[0]),
         };
+
+        let right_most_child = match typ {
+            PageType::TableInterior => {
+                // Bytes 8-11 contain the rightmost child page number for interior pages
+                Some(u32::from_be_bytes([data[8], data[9], data[10], data[11]]))
+            }
+            PageType::TableLeaf => None,
+        };
+
         let cell_count = u16::from_be_bytes([data[3], data[4]]);
-        let data_offset = 8 + (cell_count as usize * 2);
+        let data_offset = match typ {
+            PageType::TableInterior => 12 + (cell_count as usize * 2), // Interior: header is 12 bytes
+            PageType::TableLeaf => 8 + (cell_count as usize * 2),      // Leaf: header is 8 bytes
+        };
         let offset = (page_size as usize) - data.len() + data_offset;
-        let cell_pointers = data[8..data_offset]
+
+        let cell_pointer_start = match typ {
+            PageType::TableInterior => 12, // Interior pages start cell pointers at byte 12
+            PageType::TableLeaf => 8,      // Leaf pages start at byte 8
+        };
+
+        let cell_pointers = data[cell_pointer_start..data_offset]
             .chunks(2)
             .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]) as usize - offset)
             .collect();
-        let data = data[8 + (cell_count as usize * 2)..].to_vec();
+
+        let data = data[data_offset..].to_vec();
 
         Self {
             typ,
             cell_pointers,
+            right_most_child,
             data,
         }
     }
@@ -71,12 +94,18 @@ impl Page {
         value
     }
 
-    fn get_be_bytes(n: usize, data: &mut impl Iterator<Item = u8>) -> [u8; 8] {
+    fn get_be_bytes(
+        n: usize,
+        data: &mut impl Iterator<Item = u8>,
+    ) -> Result<[u8; 8], &'static str> {
         let mut bytes = [0; 8];
         for i in 0..n {
-            bytes[8 - n + i] = data.next().unwrap();
+            match data.next() {
+                Some(byte) => bytes[8 - n + i] = byte,
+                None => return Err("Unexpected end of data while reading bytes"),
+            }
         }
-        bytes
+        Ok(bytes)
     }
 
     fn get_record(&self, pointer: usize) -> Record {
@@ -103,13 +132,25 @@ impl Page {
                         6 => 8,
                         v => v,
                     } as usize;
-                    let value = i64::from_be_bytes(Self::get_be_bytes(n, &mut data));
-                    RecordValue::Int(value)
+                    match Self::get_be_bytes(n, &mut data) {
+                        Ok(bytes) => {
+                            let value = i64::from_be_bytes(bytes);
+                            RecordValue::Int(value)
+                        }
+                        Err(_) => {
+                            return Record { id, values };
+                        }
+                    }
                 }
-                7 => {
-                    let value = f64::from_be_bytes(Self::get_be_bytes(8, &mut data));
-                    RecordValue::Real(value)
-                }
+                7 => match Self::get_be_bytes(8, &mut data) {
+                    Ok(bytes) => {
+                        let value = f64::from_be_bytes(bytes);
+                        RecordValue::Real(value)
+                    }
+                    Err(_) => {
+                        return Record { id, values };
+                    }
+                },
                 8 => RecordValue::Int(0),
                 9 => RecordValue::Int(1),
                 _ if typ >= 12 => {
@@ -132,6 +173,40 @@ impl Page {
 
     pub fn records(&self) -> impl Iterator<Item = Record> + '_ {
         self.cell_pointers.iter().map(|i| self.get_record(*i))
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        matches!(self.typ, PageType::TableLeaf)
+    }
+
+    pub fn get_child_pages(&self) -> Vec<u32> {
+        match self.typ {
+            PageType::TableLeaf => Vec::new(), // Leaf pages have no children
+            PageType::TableInterior => {
+                let mut child_pages = Vec::new();
+
+                // Each cell in an interior page contains a child page number
+                for &pointer in &self.cell_pointers {
+                    // Interior page cell format: [4-byte child page][varint key]
+                    if pointer + 4 <= self.data.len() {
+                        let child_page = u32::from_be_bytes([
+                            self.data[pointer],
+                            self.data[pointer + 1],
+                            self.data[pointer + 2],
+                            self.data[pointer + 3],
+                        ]);
+                        child_pages.push(child_page);
+                    }
+                }
+
+                // Don't forget the rightmost child!
+                if let Some(rightmost) = self.right_most_child {
+                    child_pages.push(rightmost);
+                }
+
+                child_pages
+            }
+        }
     }
 }
 
@@ -160,21 +235,69 @@ impl Database {
     }
 
     pub fn load_page(&self, path: &str, page_number: usize) -> anyhow::Result<Page> {
+        // Validate page number
+        if page_number == 0 {
+            anyhow::bail!("Invalid page number: page numbers start from 1");
+        }
+
         let mut file = File::open(path)?;
+
+        // Calculate correct page offset
         let page_offset = if page_number == 1 {
-            DB_HEADER_SIZE
+            0 // Page 1 starts at offset 0
         } else {
             (page_number - 1) * (self.page_size as usize)
         };
-        file.seek(SeekFrom::Start(page_offset as u64))?;
-        let page_data_size = if page_number == 1 {
-            self.page_size as usize - DB_HEADER_SIZE
+
+        // Calculate how much data to read
+        let (read_offset, page_data_size) = if page_number == 1 {
+            (DB_HEADER_SIZE, self.page_size as usize - DB_HEADER_SIZE)
         } else {
-            self.page_size as usize
+            (0, self.page_size as usize)
         };
+
+        file.seek(SeekFrom::Start((page_offset + read_offset) as u64))?;
         let mut page_data = vec![0; page_data_size];
         file.read_exact(&mut page_data)?;
 
         Ok(Page::from_data(self.page_size, page_data))
+    }
+
+    pub fn get_all_records(
+        &self,
+        db_path: &str,
+        root_page_num: usize,
+    ) -> anyhow::Result<Vec<Record>> {
+        let mut all_records = Vec::new();
+        self.traverse_btree(db_path, root_page_num, &mut all_records)?;
+        Ok(all_records)
+    }
+
+    fn traverse_btree(
+        &self,
+        db_path: &str,
+        page_num: usize,
+        records: &mut Vec<Record>,
+    ) -> anyhow::Result<()> {
+        let page = self.load_page(db_path, page_num)?;
+
+        if page.is_leaf() {
+            // This is a leaf page - collect all its records
+            for record in page.records() {
+                records.push(record);
+            }
+        } else {
+            // This is an interior page - traverse all child pages
+            let child_pages = page.get_child_pages();
+            for child_page_num in child_pages {
+                // Validate child page number
+                if child_page_num == 0 {
+                    continue; // Skip invalid page numbers
+                }
+                self.traverse_btree(db_path, child_page_num as usize, records)?;
+            }
+        }
+
+        Ok(())
     }
 }

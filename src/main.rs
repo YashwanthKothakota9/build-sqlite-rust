@@ -159,16 +159,16 @@ fn main() -> anyhow::Result<()> {
 
             let (where_column, where_value, where_column_position) =
                 if let Some(where_string) = &where_clause {
-                    let where_parts: Vec<&str> = where_string.split_whitespace().collect();
-                    if where_parts.len() != 3 {
+                    // Parse WHERE clause: handle quoted strings with spaces
+                    let equal_pos = where_string.find(" = ");
+                    if equal_pos.is_none() {
                         bail!("Invalid WHERE clause format. Expected: column = value");
                     }
-                    let where_column = where_parts[0];
-                    let where_operator = where_parts[1];
-                    let where_value_raw = where_parts[2];
-                    if where_operator != "=" {
-                        bail!("Only '=' operator is supported in WHERE clauses");
-                    }
+                    let equal_pos = equal_pos.unwrap();
+
+                    let where_column = where_string[..equal_pos].trim();
+                    let where_value_raw = where_string[equal_pos + 3..].trim(); // Skip " = "
+
                     let where_value =
                         if where_value_raw.starts_with('\'') && where_value_raw.ends_with('\'') {
                             &where_value_raw[1..where_value_raw.len() - 1]
@@ -217,9 +217,9 @@ fn main() -> anyhow::Result<()> {
 
             // Debug output to verify it works:
             // println!("Column positions: {:?}", column_positions);
-            let table_page = db.load_page(db_path, rootpage)?;
+            let all_records = db.get_all_records(db_path, rootpage)?;
 
-            for record in table_page.records() {
+            for record in all_records {
                 // Bounds checking: ensure record has enough columns
                 let max_position = column_positions.iter().max().unwrap_or(&0);
                 if record.values.len() <= *max_position {
@@ -241,9 +241,14 @@ fn main() -> anyhow::Result<()> {
                 // Existing output logic (unchanged)
                 let mut row_values: Vec<String> = Vec::new();
 
-                for &position in &column_positions {
-                    let column_value = &record.values[position];
-                    let formatted_value = format_record_value(column_value);
+                for (i, &position) in column_positions.iter().enumerate() {
+                    let formatted_value = if requested_column_names[i] == "id" && position == 0 {
+                        // Special case: first column named "id" is the rowid
+                        record.id.to_string()
+                    } else {
+                        let column_value = &record.values[position];
+                        format_record_value(column_value)
+                    };
                     row_values.push(formatted_value);
                 }
                 let row_output = row_values.join("|");
