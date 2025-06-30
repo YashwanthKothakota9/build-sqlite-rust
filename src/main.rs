@@ -1,3 +1,20 @@
+//! # main.rs – tiny CLI that speaks (very small) SQL
+//!
+//! ```text
+//! 1) Read command-line args
+//!        │
+//!        ▼
+//! 2) Database::load()
+//!        │
+//!        ▼
+//! 3) Decide command ─┬─ .dbinfo
+//!                    ├─ .tables
+//!                    ├─ select count(*)
+//!                    └─ SELECT columns FROM table [WHERE ...]
+//! ```
+//!
+//! All heavy lifting (page parsing, searching) lives in `sqlite::db`.
+//!
 mod sqlite;
 
 use std::env;
@@ -7,6 +24,7 @@ use anyhow::bail;
 use sqlite::{Database, Record, RecordValue};
 
 // Add this function before your main() function
+// Friendly formatter: turn any RecordValue into a printable string.
 fn format_record_value(value: &RecordValue) -> String {
     match value {
         RecordValue::Text(text) => text.clone(),
@@ -17,13 +35,16 @@ fn format_record_value(value: &RecordValue) -> String {
     }
 }
 
-// Add this next to your existing format_record_value function
+// Simple helper: does the given record match the WHERE condition?
 fn matches_where_condition(record: &Record, where_column_pos: usize, expected_value: &str) -> bool {
     let actual_value = &record.values[where_column_pos];
     let actual_string = format_record_value(actual_value);
     actual_string == expected_value
 }
 
+// --------------------------------------------------------------------
+// main() – frontend dispatcher: open DB and route the command.
+// --------------------------------------------------------------------
 fn main() -> anyhow::Result<()> {
     let args = env::args().collect::<Vec<_>>();
     match args.len() {
@@ -217,7 +238,55 @@ fn main() -> anyhow::Result<()> {
 
             // Debug output to verify it works:
             // println!("Column positions: {:?}", column_positions);
-            let all_records = db.get_all_records(db_path, rootpage)?;
+
+            let all_records = if let (Some(col), Some(val)) = (&where_column, &where_value) {
+                if col.eq_ignore_ascii_case("country") {
+                    // Try to locate index entry in sqlite_schema
+                    let expected_index_name = format!("idx_{}_country", table_name);
+
+                    let index_record_opt = db.root_page.records().find(|record| {
+                        match (&record.values[0], &record.values[1]) {
+                            (RecordValue::Text(t), RecordValue::Text(name)) => {
+                                t == "index" && name.to_lowercase() == expected_index_name
+                            }
+                            _ => false,
+                        }
+                    });
+
+                    if let Some(index_record) = index_record_opt {
+                        // Extract rootpage of index
+                        let index_root = match &index_record.values[3] {
+                            RecordValue::Int(i) => *i as usize,
+                            _ => 0,
+                        };
+
+                        if index_root > 0 {
+                            if let Ok(rowids) =
+                                db.lookup_rowids_by_country(db_path, index_root, val)
+                            {
+                                // Fetch only needed records
+                                if let Ok(recs) =
+                                    db.fetch_records_by_rowids(db_path, rootpage, &rowids)
+                                {
+                                    recs
+                                } else {
+                                    db.get_all_records(db_path, rootpage)?
+                                }
+                            } else {
+                                db.get_all_records(db_path, rootpage)?
+                            }
+                        } else {
+                            db.get_all_records(db_path, rootpage)?
+                        }
+                    } else {
+                        db.get_all_records(db_path, rootpage)?
+                    }
+                } else {
+                    db.get_all_records(db_path, rootpage)?
+                }
+            } else {
+                db.get_all_records(db_path, rootpage)?
+            };
 
             for record in all_records {
                 // Bounds checking: ensure record has enough columns
