@@ -16,7 +16,7 @@ and more.
 <h1 align="center">Sqlite from scratch in Rust</h1>
 
 <div align="center">
-    <img src="/rust-5.png" alt="Project progress image">
+    <img src="/rust-8.png" alt="Project progress image">
 </div>
 
 ### Stages:
